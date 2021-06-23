@@ -6,12 +6,11 @@
 //
 
 extension Publisher {
-    // swiftlint:disable generic_type_name line_length
 
     /// Publishes either the most-recent or first element published by the upstream
     /// publisher in the specified time interval.
     ///
-    /// Use `throttle(for:scheduler:latest:`` to selectively republish elements from
+    /// Use `throttle(for:scheduler:latest:)` to selectively republish elements from
     /// an upstream publisher during an interval you specify. Other elements received from
     /// the upstream in the throttling interval aren’t republished.
     ///
@@ -47,34 +46,26 @@ extension Publisher {
     ///     the interval.
     /// - Returns: A publisher that emits either the most-recent or first element received
     ///   during the specified interval.
-    public func throttle<S>(for interval: S.SchedulerTimeType.Stride,
-                            scheduler: S,
-                            latest: Bool) -> Publishers.Throttle<Self, S>
-    where S: Scheduler
-    {
+    public func throttle<Context: Scheduler>(
+        for interval: Context.SchedulerTimeType.Stride,
+        scheduler: Context,
+        latest: Bool
+    ) -> Publishers.Throttle<Self, Context> {
         return .init(upstream: self,
                      interval: interval,
                      scheduler: scheduler,
                      latest: latest)
     }
-
-    // swiftlint:enable generic_type_name line_length
 }
 
 extension Publishers {
 
     /// A publisher that publishes either the most-recent or first element published by
     /// the upstream publisher in a specified time interval.
-    public struct Throttle<Upstream, Context>: Publisher
-    where Upstream: Publisher, Context: Scheduler
-    {
+    public struct Throttle<Upstream: Publisher, Context: Scheduler>: Publisher {
 
-        /// The kind of values published by this publisher.
         public typealias Output = Upstream.Output
 
-        /// The kind of errors this publisher might publish.
-        ///
-        /// Use `Never` if this `Publisher` does not publish errors.
         public typealias Failure = Upstream.Failure
 
         /// The publisher from which this publisher receives elements.
@@ -96,14 +87,11 @@ extension Publishers {
                     interval: Context.SchedulerTimeType.Stride,
                     scheduler: Context,
                     latest: Bool) {
-
             self.upstream = upstream
             self.interval = interval
             self.scheduler = scheduler
             self.latest = latest
         }
-
-        // swiftlint:disable generic_type_name
 
         /// Attaches the specified subscriber to this publisher.
         ///
@@ -114,65 +102,50 @@ extension Publishers {
         ///
         /// - Parameter subscriber: The subscriber to attach to this ``Publisher``,
         ///     after which it can receive values.
-        public func receive<S>(subscriber: S)
-        where S: Subscriber, Upstream.Failure == S.Failure, Upstream.Output == S.Input
+        public func receive<Downstream: Subscriber>(subscriber: Downstream)
+            where Downstream.Input == Output, Downstream.Failure == Failure
         {
-            let inner = Inner(interval: interval,
-                              scheduler: scheduler,
-                              latest: latest,
-                              downstream: subscriber)
+            let inner = Inner(parent: self, downstream: subscriber)
             upstream.subscribe(inner)
         }
-
-        // swiftlint:enable generic_type_name
     }
 }
 
 extension Publishers.Throttle {
     private final class Inner<Downstream: Subscriber>
-    : Subscriber,
-      Subscription,
-      CustomStringConvertible,
-      CustomReflectable,
-      CustomPlaygroundDisplayConvertible
-    where Downstream.Input == Upstream.Output, Downstream.Failure == Upstream.Failure
+        : Subscriber,
+          Subscription,
+          CustomStringConvertible,
+          CustomReflectable,
+          CustomPlaygroundDisplayConvertible
+        where Downstream.Input == Output, Downstream.Failure == Failure
     {
         typealias Input = Upstream.Output
         typealias Failure = Upstream.Failure
 
+        typealias Parent = Publishers.Throttle<Upstream, Context>
+
         private enum State {
-            case awaitingSubscription(Downstream)
-            case subscribed(Subscription, Downstream)
-            case pendingTerminal(Subscription, Downstream)
+            case ready(Parent, Downstream)
+            case subscribed(Parent,
+                            Downstream,
+                            Subscription,
+                            Subscribers.Completion<Failure>?)
             case terminal
         }
 
         private let lock = UnfairLock.allocate()
-        private let interval: Context.SchedulerTimeType.Stride
-        private let scheduler: Context
-        private let latest: Bool
-        private var state: State
         private let downstreamLock = UnfairRecursiveLock.allocate()
+        private var state: State
+        private var demand = Subscribers.Demand.none
+        private var currentValue: Input?
+        private var dueTime: Context.SchedulerTimeType
+        private var scheduledToEmit = false
+        private var alreadySentSubscription = false
 
-        private var lastEmissionTime: Context.SchedulerTimeType?
-
-        private var pendingInput: Input?
-        private var pendingCompletion: Subscribers.Completion<Failure>?
-
-        private var demand: Subscribers.Demand = .none
-
-        private var lastTime: Context.SchedulerTimeType
-
-        init(interval: Context.SchedulerTimeType.Stride,
-             scheduler: Context,
-             latest: Bool,
-             downstream: Downstream) {
-            self.state = .awaitingSubscription(downstream)
-            self.interval = interval
-            self.scheduler = scheduler
-            self.latest = latest
-
-            self.lastTime = scheduler.now
+        init(parent: Parent, downstream: Downstream) {
+            self.state = .ready(parent, downstream)
+            self.dueTime = parent.scheduler.now
         }
 
         deinit {
@@ -182,175 +155,117 @@ extension Publishers.Throttle {
 
         func receive(subscription: Subscription) {
             lock.lock()
-            guard case let .awaitingSubscription(downstream) = state else {
+            guard case let .ready(parent, downstream) = state else {
                 lock.unlock()
                 subscription.cancel()
                 return
             }
-            self.lastTime = scheduler.now
-
-            state = .subscribed(subscription, downstream)
+            state = .subscribed(parent, downstream, subscription, nil)
+            dueTime = parent.scheduler.now
+            alreadySentSubscription = true
             lock.unlock()
 
-            subscription.request(.unlimited)
-
+            // TODO: Test order
             downstreamLock.lock()
             downstream.receive(subscription: self)
             downstreamLock.unlock()
+
+            subscription.request(.unlimited)
         }
 
         func receive(_ input: Input) -> Subscribers.Demand {
             lock.lock()
-            guard case .subscribed = state else {
+            guard case let .subscribed(parent, _, _, nil) = state else {
                 lock.unlock()
                 return .none
             }
 
-            let lastTime = scheduler.now
-            self.lastTime = lastTime
+            let late = parent.scheduler.now >= dueTime
 
-            guard demand > .none else {
-                lock.unlock()
-                return .none
-            }
-
-            let hasScheduledOutput = (pendingInput != nil || pendingCompletion != nil)
-
-            if hasScheduledOutput && latest {
-                pendingInput = input
-                lock.unlock()
-            } else if !hasScheduledOutput {
-                let minimumEmissionTime =
-                    lastEmissionTime.map { $0.advanced(by: interval) }
-
-                let emissionTime =
-                    minimumEmissionTime.map { Swift.max(lastTime, $0) } ?? lastTime
-
-                demand -= 1
-
-                pendingInput = input
-                lock.unlock()
-
-                let action: () -> Void = { [weak self] in
-                    self?.scheduledEmission()
-                }
-
-                if emissionTime == lastTime {
-                    scheduler.schedule(action)
-                } else {
-                    scheduler.schedule(after: emissionTime, action)
-                }
+            if parent.latest {
+                currentValue = input
             } else {
-                lock.unlock()
+                if late {
+                    dueTime = dueTime.advanced(by: parent.interval)
+                    currentValue = input
+                } else {
+                    if currentValue == nil {
+                        currentValue = input
+                    }
+                }
             }
+
+            if scheduledToEmit || demand == .none {
+                lock.unlock()
+                return .none
+            }
+
+            scheduleEmittingAndConsumeLock(scheduler: parent.scheduler, late: late)
 
             return .none
         }
 
         func receive(completion: Subscribers.Completion<Failure>) {
             lock.lock()
-            guard case let .subscribed(subscription, downstream) = state else {
-                lock.unlock()
-                return
-            }
-            let lastTime = scheduler.now
-            self.lastTime = lastTime
-            state = .pendingTerminal(subscription, downstream)
-
-            let hasScheduledOutput = (pendingInput != nil || pendingCompletion != nil)
-
-            if hasScheduledOutput && pendingCompletion == nil {
-                pendingCompletion = completion
-                lock.unlock()
-            } else if !hasScheduledOutput {
-                pendingCompletion = completion
-                lock.unlock()
-
-                scheduler.schedule { [weak self] in
-                    self?.scheduledEmission()
+            guard case let .subscribed(parent,
+                                       downstream,
+                                       subscription,
+                                       nil) = state
+            else {
+                // TODO: Test with non-nil completion
+                if !scheduledToEmit {
+                    state = .terminal
                 }
-            } else {
-                lock.unlock()
-            }
-        }
-
-        private func scheduledEmission() {
-            lock.lock()
-
-            let downstream: Downstream
-
-            switch state {
-            case .awaitingSubscription, .terminal:
                 lock.unlock()
                 return
-            case let .subscribed(_, foundDownstream),
-                 let .pendingTerminal(_, foundDownstream):
-                downstream = foundDownstream
+            }
+            dueTime = parent.scheduler.now
+            state = .subscribed(parent, downstream, subscription, completion)
+
+            if scheduledToEmit {
+                lock.unlock()
+                return
             }
 
-            if self.pendingInput != nil && self.pendingCompletion == nil {
-                lastEmissionTime = scheduler.now
-            }
-
-            let pendingInput = self.pendingInput
-            let pendingCompletion = self.pendingCompletion
-
-            self.pendingInput = nil
-            self.pendingCompletion = nil
-
-            if pendingCompletion != nil {
-                state = .terminal
-            }
-
+            scheduledToEmit = true
             lock.unlock()
-
-            downstreamLock.lock()
-
-            let newDemand: Subscribers.Demand
-            if let input = pendingInput {
-                newDemand = downstream.receive(input)
-            } else {
-                newDemand = .none
-            }
-
-            if let completion = pendingCompletion {
-                downstream.receive(completion: completion)
-            }
-            downstreamLock.unlock()
-
-            guard newDemand > 0 else { return }
-            self.lock.lock()
-            demand += newDemand
-            self.lock.unlock()
+            parent.scheduler.schedule(emitToDownstream)
         }
 
         func request(_ demand: Subscribers.Demand) {
-            guard demand > 0 else { return }
             lock.lock()
-            guard case .subscribed = state else {
+            guard case let .subscribed(parent, _, _, nil) = state else {
+                // TODO: Test with non-nil completion
                 lock.unlock()
                 return
             }
+
             self.demand += demand
-            lock.unlock()
+
+            if currentValue == nil || scheduledToEmit {
+                lock.unlock()
+                return
+            }
+
+            // TODO: Test if we schedule even for zero demand
+
+            scheduleEmittingAndConsumeLock(scheduler: parent.scheduler,
+                                           late: parent.scheduler.now >= dueTime)
         }
 
         func cancel() {
             lock.lock()
-
-            let subscription: Subscription?
-            switch state {
-            case let .subscribed(existingSubscription, _),
-                 let .pendingTerminal(existingSubscription, _):
-                subscription = existingSubscription
-            case .awaitingSubscription, .terminal:
-                subscription = nil
+            guard case let .subscribed(_, _, subscription, _) = state else {
+                state = .terminal
+                lock.unlock()
+                return
             }
-
             state = .terminal
+            currentValue = nil
+            demand = .none
             lock.unlock()
 
-            subscription?.cancel()
+            subscription.cancel()
         }
 
         var description: String { return "Throttle" }
@@ -358,5 +273,72 @@ extension Publishers.Throttle {
         var customMirror: Mirror { return Mirror(self, children: EmptyCollection()) }
 
         var playgroundDescription: Any { return description }
+
+        // MARK: - Private
+
+        private func scheduleEmittingAndConsumeLock(scheduler: Context, late: Bool) {
+#if DEBUG
+            lock.assertOwner()
+#endif
+            scheduledToEmit = true
+            if late {
+                lock.unlock()
+                scheduler.schedule(emitToDownstream)
+            } else {
+                let dueTime = self.dueTime
+                lock.unlock()
+                scheduler.schedule(after: dueTime, emitToDownstream)
+            }
+        }
+
+        private func emitToDownstream() {
+            lock.lock()
+            guard case let .subscribed(parent,
+                                       downstream,
+                                       _,
+                                       completion) = state, scheduledToEmit
+            else {
+                lock.unlock()
+                return
+            }
+
+            var shouldSendValueDownstream = false
+            let valueToSend = currentValue
+            if valueToSend != nil {
+                if demand == .none {
+                    shouldSendValueDownstream = false
+                } else {
+                    demand -= 1
+                    currentValue = nil
+                    shouldSendValueDownstream = true
+                }
+            }
+
+            scheduledToEmit = false
+            if completion == nil {
+                dueTime = parent.scheduler.now.advanced(by: parent.interval)
+            } else {
+                state = .terminal
+            }
+            lock.unlock()
+            downstreamLock.lock()
+
+            let newDemand = shouldSendValueDownstream
+                ? (valueToSend.map(downstream.receive(_:)) ?? .none)
+                : .none
+
+            if let completion = completion {
+                downstream.receive(completion: completion)
+            }
+            downstreamLock.unlock()
+
+            if newDemand == .none || completion != nil {
+                return
+            }
+
+            lock.lock()
+            demand += newDemand
+            lock.unlock()
+        }
     }
 }

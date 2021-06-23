@@ -359,9 +359,11 @@ final class VirtualTimeScheduler: Scheduler {
 
     func executeScheduledActions(until deadline: SchedulerTimeType? = nil) {
         precondition(deadline.map { $0 >= _now } ?? true)
-        while let (time, action) = workQueue.min(), deadline.map({ time <= $0 }) ?? true {
+        while let (nextActionTime, action) = workQueue.min(),
+              deadline.map({ nextActionTime <= $0 }) ?? true
+        {
             workQueue.extractMin()
-            _now = max(time, _now)
+            _now = max(nextActionTime, _now)
             action()
         }
     }
