@@ -32,7 +32,7 @@ final class AutomaticallyFinish<Output, Failure: Error> {
     func listen(receiveCompletion: @escaping (Subscribers.Completion<Failure>) -> Void,
                 receiveValue: @escaping (Output) -> Void) -> AnyCancellable {
         return publisher.sink(receiveCompletion: receiveCompletion,
-                            receiveValue: receiveValue)
+                              receiveValue: receiveValue)
     }
 }
 
