@@ -1,0 +1,268 @@
+${template_header}
+//
+//  Publishers.CombineLatest.swift.gyb
+//  
+//
+//  Created by Sergej Jaskiewicz on 10.12.2019.
+//
+%{
+from gyb_opencombine_support import (
+    suffix_variadic,
+    list_with_suffix_variadic,
+    indent
+)
+
+import string
+
+instantiations = [(2, 'two', 'A second'),
+                  (3, 'three', 'A third'),
+                  (4, 'four', 'A fourth')]
+
+def make_publisher_name(arity):
+    return suffix_variadic('CombineLatest', arity, arity - 1)
+
+def make_upstream_types(arity, start=0):
+    return [str(c) for c in string.ascii_uppercase[start:(start + arity)]]
+
+def make_upstream_generic_constraints(upstream_types, first_is_self=False):
+
+    format_string = '{0}Failure == {1}.Failure'
+
+    def format(i):
+        return format_string.format(upstream_types[i] + '.',
+                                    upstream_types[i + 1])
+
+    result = [format(i) for i in range(len(upstream_types) - 1)]
+
+    if first_is_self:
+        result.insert(0, format_string.format('', upstream_types[0]))
+
+    return result
+
+def declare_combine_latest_method(arity, transform):
+    arg_count = arity - 1
+    declaration_format = """\
+public func combineLatest<{}>(
+    {}
+) -> {}
+    where {}\
+"""
+    upstream_types = make_upstream_types(arg_count, 15)
+    method_generic_params = \
+        [upstream_type + ': Publisher' for upstream_type in upstream_types]
+    if transform:
+        method_generic_params.append('Result')
+    cs_method_generic_params = ', '.join(method_generic_params)
+    method_args = ['_ other: P'] if arg_count == 1 \
+                  else ['_ publisher{}: {}'.format(i + 1, upstream_types[i]) \
+                        for i in range(arg_count)]
+    if transform:
+        output_types = ['Output'] + ['{}.Output'.format(upstream_type) \
+                                     for upstream_type in upstream_types]
+        cs_output_types = ', '.join(output_types)
+        method_args \
+            .append('_ transform: @escaping ({}) -> Result'.format(cs_output_types))
+    cs_method_args = ',\n    '.join(method_args)
+
+    publisher_generic_params = ['Self'] + upstream_types
+
+    cs_publisher_generic_params = ', '.join(publisher_generic_params)
+
+    publisher_name = 'Publishers.{}<{}>'.format(make_publisher_name(arity),
+                                                cs_publisher_generic_params)
+
+    if transform:
+        publisher_name = 'Publishers.Map<{}, Result>'.format(publisher_name)
+
+    generic_constraints = make_upstream_generic_constraints(upstream_types,
+                                                            first_is_self=True)
+
+    cs_generic_constraints = ',\n          '.join(generic_constraints)
+
+    declaration = declaration_format.format(cs_method_generic_params,
+                                            cs_method_args,
+                                            publisher_name,
+                                            cs_generic_constraints)
+
+    return indent(declaration, 4)
+}%
+
+// swiftlint:disable generic_type_name
+// swiftlint:disable large_tuple
+
+// MARK: - CombineLatest methods on Publisher
+
+extension Publisher {
+
+% for arity, _, _ in instantiations:
+%
+%     argument_names = ['other'] \
+%         if arity == 2 else ['publisher{}'.format(i) for i in range(1, arity)]
+%     doc_cardinal = 'an additional publisher' if arity == 2 \
+%         else '{} additional publishers'.format(instantiations[arity - 3][1])
+    /// Subscribes to ${doc_cardinal} and publishes a tuple upon
+    /// receiving output from either publisher.
+    ///
+    /// The combined publisher passes through any requests to *all* upstream publishers.
+    /// However, it still obeys the demand-fulfilling rule of only sending the request
+    /// amount downstream. If the demand isn’t `.unlimited`, it drops values from upstream
+    /// publishers. It implements this by using a buffer size of 1 for each upstream, and
+    /// holds the most recent value in each buffer.
+    /// All upstream publishers need to finish for this publisher to finsh. If an upstream
+    /// publisher never publishes a value, this publisher never finishes.
+    /// If any of the combined publishers terminates with a failure, this publisher also
+    /// fails.
+    ///
+    /// - Parameters:
+%     for i in range(arity - 1):
+%         param_doc = 'Another' if arity == 2 else instantiations[i][2]
+    ///   - ${argument_names[i]}: ${param_doc} publisher to combine with this one.
+%     end
+    /// - Returns: A publisher that receives and combines elements from this and another
+    ///   publisher.
+${declare_combine_latest_method(arity, transform=False)}
+    {
+        return .init(self, ${', '.join(argument_names)})
+    }
+
+    /// Subscribes to ${doc_cardinal} and invokes a closure
+    /// upon receiving output from either publisher.
+    ///
+    /// The combined publisher passes through any requests to *all* upstream publishers.
+    /// However, it still obeys the demand-fulfilling rule of only sending the request
+    /// amount downstream. If the demand isn’t `.unlimited`, it drops values from upstream
+    /// publishers. It implements this by using a buffer size of 1 for each upstream, and
+    /// holds the most recent value in each buffer.
+    /// All upstream publishers need to finish for this publisher to finsh. If an upstream
+    /// publisher never publishes a value, this publisher never finishes.
+    /// If any of the combined publishers terminates with a failure, this publisher also
+    /// fails.
+    ///
+    /// - Parameters:
+%     for i in range(arity - 1):
+%         param_doc = 'Another' if arity == 2 else instantiations[i][2]
+    ///   - ${argument_names[i]}: ${param_doc} publisher to combine with this one.
+%     end
+    ///   - transform: A closure that receives the most recent value from each publisher
+    ///     and returns a new value to publish.
+    /// - Returns: A publisher that receives and combines elements from this and another
+    ///   publisher.
+${declare_combine_latest_method(arity, transform=True)}
+    {
+%     publisher_name = make_publisher_name(arity)
+        return Publishers.${publisher_name}(self, ${', '.join(argument_names)}).map {
+            transform(${', '.join(['${}'.format(i) for i in range(arity)])})
+        }
+    }
+% end
+}
+
+// MARK: - CombineLatest publishers
+
+extension Publishers {
+% for arity, cardinal, _ in instantiations:
+%     publisher_name = make_publisher_name(arity)
+%     upstream_types = make_upstream_types(arity)
+%
+%     upstream_generic_params = \
+%         [upstream_type + ': Publisher' for upstream_type in upstream_types]
+%
+%     cs_upstream_generic_params = ', '.join(upstream_generic_params)
+%
+%     output_types = [upstream_type + '.Output' for upstream_type in upstream_types]
+%
+%     cs_output_types = ', '.join(output_types)
+%
+%     upstream_generic_constraints = \
+%         make_upstream_generic_constraints(upstream_types)
+%
+%     cs_upstream_generic_constraints = \
+%         ',\n              '.join(upstream_generic_constraints)
+%
+%     init_args = ['_ {}: {}'.format(upstream_type.lower(), upstream_type) \
+%                  for upstream_type in upstream_types]
+%     cs_init_args = ',\n            '.join(init_args)
+%
+%     self_fields = [upstream_type.lower() for upstream_type in upstream_types]
+
+    /// A publisher that receives and combines the latest elements from ${cardinal}
+    /// publishers.
+    public struct ${publisher_name}<${cs_upstream_generic_params}>
+        : Publisher
+        where ${cs_upstream_generic_constraints}
+    {
+        public typealias Output = (${cs_output_types})
+
+        public typealias Failure = ${upstream_types[0]}.Failure
+%     for upstream_type in upstream_types:
+
+        public let ${upstream_type.lower()}: ${upstream_type}
+%     end
+
+        public init(
+            ${cs_init_args}
+        ) {
+%     for self_field in self_fields:
+            self.${self_field} = ${self_field}
+%     end
+        }
+
+        public func receive<Downstream: Subscriber>(subscriber: Downstream)
+            where Downstream.Failure == Failure,
+                  Downstream.Input == Output
+        {
+%     cs_indented_output_types = (',\n' + (50 * ' ')).join(output_types)
+            typealias Inner = CombineLatest${arity}Inner<${cs_indented_output_types},
+                                                  Failure,
+                                                  Downstream>
+            let inner = Inner(downstream: subscriber, upstreamCount: ${arity})
+%     for i in range(arity):
+            ${self_fields[i]}.subscribe(Inner.Side(index: ${i}, combiner: inner))
+%     end
+            subscriber.receive(subscription: inner)
+        }
+    }
+% end
+}
+
+// MARK: - Equatable conformances
+% for arity, _, _ in instantiations:
+%
+%     publisher_name = make_publisher_name(arity)
+%
+%     upstream_types = make_upstream_types(arity)
+%
+%     constraints = [upstream_type + ': Equatable' for upstream_type in upstream_types]
+%     cs_constraints = ',\n'.join(constraints)
+%     cs_constraints = indent(cs_constraints, 8)
+%
+
+extension Publishers.${publisher_name}: Equatable
+    where
+${cs_constraints} {}
+% end
+
+// MARK: - Inners
+% for arity, _, _ in instantiations:
+%
+%     publisher_name = make_publisher_name(arity)
+%
+%     upstream_types = make_upstream_types(arity)
+%
+%     input_types = ['Input{}'.format(i) for i in range(arity)]
+%
+%     converters = ['values[{}] as! {}'.format(i, input_types[i]) for i in range(arity)]
+%     output_type = '({})'.format(', '.join(input_types))
+
+private final class CombineLatest${arity}Inner<${(',\n' + (40 * ' ')).join(input_types)},
+                                        Failure,
+                                        Downstream: Subscriber>
+    : AbstractCombineLatest<${output_type}, Failure, Downstream>
+    where Downstream.Input == ${output_type},
+          Downstream.Failure == Failure
+{
+    override func convert(values: [Any?]) -> (${', '.join(input_types)}) {
+        return (${',\n                '.join(converters)})
+    }
+}
+% end
