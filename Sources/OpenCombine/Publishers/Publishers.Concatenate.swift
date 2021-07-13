@@ -233,7 +233,7 @@ extension Publishers.Concatenate {
 
         private var suffixState = SubscriptionStatus.awaitingSubscription
 
-        private let suffix: Suffix
+        private var suffix: Suffix?
 
         private var pending = Subscribers.Demand.none
 
@@ -266,8 +266,18 @@ extension Publishers.Concatenate {
                 prefixState.subscription ?? suffixState.subscription
             prefixState = .terminal
             suffixState = .terminal
-            lock.unlock()
-            upstreamSubscription?.cancel()
+
+            // We MUST release the object AFTER unlocking the lock,
+            // since releasing it may trigger execution of arbitrary code,
+            // for example, if the object has a deinit.
+            // When the object deallocates, its deinit is called, and holding
+            // the lock at that moment can lead to deadlocks.
+
+            withExtendedLifetime(suffix) {
+                suffix = nil
+                lock.unlock()
+                upstreamSubscription?.cancel()
+            }
         }
 
         var description: String { return "Concatenate" }
@@ -320,7 +330,7 @@ extension Publishers.Concatenate {
             lock.unlock()
             switch completion {
             case .finished:
-                suffix.subscribe(SuffixSubscriber(inner: self))
+                suffix?.subscribe(SuffixSubscriber(inner: self))
             case .failure:
                 downstream.receive(completion: completion)
             }

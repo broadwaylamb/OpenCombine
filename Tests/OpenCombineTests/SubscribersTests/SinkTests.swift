@@ -210,6 +210,82 @@ final class SinkTests: XCTestCase {
                               releasesClosures: true)
     }
 
+    func testReceiveCompletionWhileCancelling() {
+        // https://github.com/OpenCombine/OpenCombine/issues/208
+
+        let cancellable: AnyCancellable
+
+        do {
+            let autofinish = AutomaticallyFinish<Int, Never>()
+
+            cancellable = autofinish.listen(
+                receiveCompletion: { _ in },
+                receiveValue: { _ in
+                    XCTFail("Should not be called")
+                    _ = autofinish // capture
+                }
+            )
+        }
+
+        // autofinish is deallocated here, a completion is sent to the sink
+        cancellable.cancel()
+    }
+
+    func testReceiveCompletionWhileCancelling2() {
+        // https://github.com/OpenCombine/OpenCombine/issues/208
+
+        let cancellable: AnyCancellable
+
+        do {
+            let autofinish = AutomaticallyFinish<Int, Never>()
+
+            cancellable = autofinish.listen(
+                receiveCompletion: { _ in
+                    XCTFail("Should not be called")
+                    _ = autofinish // capture
+                },
+                receiveValue: { _ in }
+            )
+        }
+
+        // autofinish is deallocated here, a completion is sent to the sink
+        cancellable.cancel()
+    }
+
+    func testReceiveCompletionWhileCompleting() {
+        // https://github.com/OpenCombine/OpenCombine/issues/208
+
+        let cancellable: AnyCancellable
+
+        let finish: () -> Void
+
+        var receiveCompletionCalled = false
+
+        do {
+            let autofinish = AutomaticallyFinish<Int, Never>()
+
+            cancellable = autofinish.listen(
+                receiveCompletion: { _ in
+                    receiveCompletionCalled = true
+                },
+                receiveValue: { _ in
+                    XCTFail("Should not be called")
+                    _ = autofinish // capture
+                }
+            )
+
+            let underlyingPublisher = autofinish.publisher
+
+            finish = { underlyingPublisher.send(completion: .finished) }
+        }
+
+        finish() // autofinish is deallocated here, a completion is sent to the sink
+
+        cancellable.cancel()
+
+        XCTAssertTrue(receiveCompletionCalled)
+    }
+
     func testRecursiveCompletion() {
         var recursionCounter = 10
         var delayedSink: Sut?

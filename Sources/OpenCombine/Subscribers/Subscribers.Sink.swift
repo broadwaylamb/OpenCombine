@@ -73,8 +73,22 @@ extension Subscribers {
 
         public func receive(completion: Subscribers.Completion<Failure>) {
             lock.lock()
+            status = .terminal
             let receiveCompletion = self.receiveCompletion
-            terminateAndConsumeLock()
+            self.receiveCompletion = { _ in }
+
+            // We MUST release the closures AFTER unlocking the lock,
+            // since releasing a closure may trigger execution of arbitrary code,
+            // for example, if the closure captures an object with a deinit.
+            // When closure deallocates, the object's deinit is called, and holding
+            // the lock at that moment can lead to deadlocks.
+            // See https://github.com/OpenCombine/OpenCombine/issues/208
+
+            withExtendedLifetime(receiveValue) {
+                receiveValue = { _ in }
+                lock.unlock()
+            }
+
             receiveCompletion(completion)
         }
 
@@ -84,18 +98,21 @@ extension Subscribers {
                 lock.unlock()
                 return
             }
-            terminateAndConsumeLock()
-            subscription.cancel()
-        }
-
-        private func terminateAndConsumeLock() {
-#if DEBUG
-            lock.assertOwner()
-#endif
             status = .terminal
-            receiveValue = { _ in }
-            receiveCompletion = { _ in }
-            lock.unlock()
+
+            // We MUST release the closures AFTER unlocking the lock,
+            // since releasing a closure may trigger execution of arbitrary code,
+            // for example, if the closure captures an object with a deinit.
+            // When closure deallocates, the object's deinit is called, and holding
+            // the lock at that moment can lead to deadlocks.
+            // See https://github.com/OpenCombine/OpenCombine/issues/208
+
+            withExtendedLifetime((receiveValue, receiveCompletion)) {
+                receiveCompletion = { _ in }
+                receiveValue = { _ in }
+                lock.unlock()
+            }
+            subscription.cancel()
         }
     }
 }

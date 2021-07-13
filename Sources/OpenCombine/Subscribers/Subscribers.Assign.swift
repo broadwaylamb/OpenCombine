@@ -112,8 +112,17 @@ extension Subscribers {
             lock.assertOwner()
 #endif
             status = .terminal
-            object = nil
-            lock.unlock()
+
+            // We MUST release the object AFTER unlocking the lock,
+            // since releasing it may trigger execution of arbitrary code,
+            // for example, if the object has a deinit.
+            // When the object deallocates, its deinit is called, and holding
+            // the lock at that moment can lead to deadlocks.
+
+            withExtendedLifetime(object) {
+                object = nil
+                lock.unlock()
+            }
         }
     }
 }

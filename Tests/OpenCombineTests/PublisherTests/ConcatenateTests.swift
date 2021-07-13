@@ -377,6 +377,60 @@ final class ConcatenateTests: XCTestCase {
         XCTAssertEqual(publisher.prepend(CollectionOfOne(42)).prefix.sequence.first, 42)
     }
 
+    func testReleasesSuffixOnCancellation() throws {
+        var suffixIsDestroyed = false
+
+        var downstreamSubscription: Subscription?
+
+        do {
+            let prefix =
+                CustomPublisherBase<Int, Never>(subscription: CustomSubscription())
+            let suffix =
+                CustomPublisherBase<Int, Never>(subscription: CustomSubscription())
+            suffix.onDeinit = {
+                suffixIsDestroyed = true
+            }
+
+            let tracking = TrackingSubscriberBase<Int, Never>(
+                receiveSubscription: {
+                    downstreamSubscription = $0
+                }
+            )
+
+            prefix.append(suffix).subscribe(tracking)
+        }
+
+        XCTAssertFalse(suffixIsDestroyed)
+
+        try XCTUnwrap(downstreamSubscription).cancel()
+
+        XCTAssertTrue(suffixIsDestroyed)
+    }
+
+    func testReceiveCompletionWhileCancelling() throws {
+
+        var downstreamSubscription: Subscription?
+
+        do {
+            let prefix =
+                CustomPublisherBase<Int, Never>(subscription: CustomSubscription())
+            let autofinish = AutomaticallyFinish<Int, Never>()
+
+            let tracking = TrackingSubscriberBase<Int, Never>(
+                receiveSubscription: {
+                    downstreamSubscription = $0
+                }
+            )
+
+            prefix.append(autofinish).subscribe(tracking)
+
+            prefix.send(completion: .finished)
+        }
+
+        // autofinish is deallocated here, a completion is sent
+        try XCTUnwrap(downstreamSubscription).cancel()
+    }
+
     func testAppendReceiveValueBeforeSubscription() {
         testReceiveValueBeforeSubscription(
             value: 12,

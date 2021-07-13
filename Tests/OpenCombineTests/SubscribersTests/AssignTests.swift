@@ -137,4 +137,40 @@ final class AssignTests: XCTestCase {
         publisher.send(100)
         XCTAssertEqual(object.value, 42)
     }
+
+    func testReceiveCompletionWhileCancelling() {
+        let cancellable: AnyCancellable
+
+        do {
+            let object = ObjectToModify()
+            cancellable = object.autofinish.assign(to: \.value, on: object)
+        }
+
+        // autofinish is deallocated here, a completion is sent to the sink
+        cancellable.cancel()
+    }
+
+    func testReceiveCompletionWhileCompleting() {
+        let cancellable: AnyCancellable
+
+        let finish: () -> Void
+
+        do {
+            let object = ObjectToModify()
+            cancellable = object.autofinish.assign(to: \.value, on: object)
+
+            let underlyingPublisher = object.autofinish.publisher
+
+            finish = { underlyingPublisher.send(completion: .finished) }
+        }
+
+        finish() // autofinish is deallocated here, a completion is sent to the sink
+
+        cancellable.cancel()
+    }
+}
+
+final class ObjectToModify {
+    let autofinish = AutomaticallyFinish<Int, Never>()
+    var value = 0
 }
